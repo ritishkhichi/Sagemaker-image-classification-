@@ -1,0 +1,251 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+variable "project_name" {
+  description = "Name of the project"
+  type        = string
+}
+
+variable "endpoint_name" {
+  description = "Name of the SageMaker endpoint"
+  type        = string
+}
+
+variable "execution_role_arn" {
+  description = "ARN of the IAM execution role for SageMaker"
+  type        = string
+}
+
+variable "model_package_group_name" {
+  description = "Name of the SageMaker Model Package Group"
+  type        = string
+}
+
+variable "model_package_arn" {
+  description = "Versioned ARN of the Approved model package the Terraform-managed model serves, for example arn:aws:sagemaker:us-east-1:111122223333:model-package/<group>/1. Later approvals are rolled out by the auto-deploy Lambda, so this only seeds the first deployment."
+  type        = string
+  default     = ""
+}
+
+variable "serving_image_uri" {
+  description = "Inference image to run the package's artefact on, pinned by digest (the patched image). Pass the same value to the auto-deployment module so every model runs on one image. Empty = use the image recorded in the model package."
+  type        = string
+  default     = ""
+}
+
+################################################################################
+# Endpoint Configuration
+################################################################################
+
+variable "use_serverless_inference" {
+  description = <<-EOT
+    When true, provision a SageMaker Serverless Inference variant instead of
+    an instance-based real-time variant. Serverless scales to zero when idle
+    (large cost savings for low-traffic endpoints like a blog demo) but loses
+    several features:
+
+      - No DataCaptureConfig on the endpoint config (drift detection cannot
+        read captured payloads; your inference handler must log predictions
+        itself if drift detection matters).
+      - No Application Auto Scaling (scales internally via max_concurrency).
+      - Cold starts of 1-5 seconds after idle periods.
+      - Max memory = 6 GB, max concurrent requests per variant = 200.
+
+    Default is false to preserve the project's compliance/monitoring story.
+    Opt in only when the cost win outweighs these tradeoffs.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "serverless_memory_size_mb" {
+  description = "Memory (MB) allocated per serverless inference request. Valid values: 1024, 2048, 3072, 4096, 5120, 6144. Only used when use_serverless_inference = true."
+  type        = number
+  default     = 3072
+
+  validation {
+    condition     = contains([1024, 2048, 3072, 4096, 5120, 6144], var.serverless_memory_size_mb)
+    error_message = "serverless_memory_size_mb must be one of: 1024, 2048, 3072, 4096, 5120, 6144."
+  }
+}
+
+variable "serverless_max_concurrency" {
+  description = "Maximum concurrent invocations per serverless variant (1-200). Only used when use_serverless_inference = true."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.serverless_max_concurrency >= 1 && var.serverless_max_concurrency <= 200
+    error_message = "serverless_max_concurrency must be between 1 and 200."
+  }
+}
+
+variable "initial_instance_count" {
+  description = "Initial number of instances for the endpoint"
+  type        = number
+  default     = 1
+}
+
+variable "instance_type" {
+  description = "Instance type for the SageMaker endpoint"
+  type        = string
+  default     = "ml.m5.xlarge"
+}
+
+variable "data_capture_sampling_percentage" {
+  description = "Percentage of invocations written to data capture (0-100). Real-time mode only."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.data_capture_sampling_percentage >= 0 && var.data_capture_sampling_percentage <= 100
+    error_message = "data_capture_sampling_percentage must be between 0 and 100."
+  }
+}
+
+variable "data_capture_input" {
+  description = "Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (potential PHI, several MB per request)."
+  type        = bool
+  default     = false
+}
+
+variable "monitoring_bucket" {
+  description = "S3 bucket name for data capture and monitoring output"
+  type        = string
+}
+
+variable "volume_kms_key_arn" {
+  description = "KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data (potential PHI for a medical model), so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key."
+  type        = string
+  default     = null
+}
+
+variable "shadow_model_name" {
+  description = "Name of an existing SageMaker model to run as a shadow variant (Part 3 shadow testing). The shadow receives a copy of production traffic but its predictions are not returned to callers. Null = no shadow variant. Real-time only."
+  type        = string
+  default     = null
+}
+
+variable "initial_variant_weight" {
+  description = "Initial traffic weight for the primary production variant. With one variant this is always 100% of traffic; exposing it lets callers add a weighted canary variant and shift traffic via update_endpoint_weights_and_capacities."
+  type        = number
+  default     = 1
+}
+
+################################################################################
+# Auto-Scaling
+################################################################################
+
+variable "min_capacity" {
+  description = "Minimum number of instances for auto-scaling"
+  type        = number
+  default     = 1
+}
+
+variable "max_capacity" {
+  description = "Maximum number of instances for auto-scaling"
+  type        = number
+  default     = 3
+}
+
+variable "target_concurrent_requests_per_model" {
+  description = "Target concurrent in-flight requests per model container. Uses the SageMaker high-resolution metric (10s granularity) for sub-minute scale-out detection."
+  type        = number
+  default     = 5
+}
+
+################################################################################
+# CloudWatch Alarms
+################################################################################
+
+variable "error_count_threshold" {
+  description = "Rollback fires when Invocation5XXErrors or InvocationModelErrors (Sum per minute) exceed this for 2 consecutive minutes."
+  type        = number
+  default     = 3
+}
+
+variable "latency_threshold" {
+  description = "Latency threshold in milliseconds for the CloudWatch alarm"
+  type        = number
+  default     = 30000
+}
+
+################################################################################
+# Tags
+################################################################################
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+################################################################################
+# Deployment
+################################################################################
+
+variable "traffic_routing_type" {
+  description = "How the blue/green update shifts traffic to the new fleet: CANARY (canary_size_percent first, then the rest), LINEAR (linear_step_percent per step) or ALL_AT_ONCE. CANARY and LINEAR need at least 2 instances (initial_instance_count and min_capacity). Serverless variants always use ALL_AT_ONCE."
+  type        = string
+  default     = "CANARY"
+
+  validation {
+    condition     = contains(["ALL_AT_ONCE", "CANARY", "LINEAR"], var.traffic_routing_type)
+    error_message = "traffic_routing_type must be ALL_AT_ONCE, CANARY or LINEAR."
+  }
+}
+
+variable "canary_size_percent" {
+  description = "Percentage of the new fleet's capacity that takes traffic during the canary step (CAPACITY_PERCENT). SageMaker allows at most 50%. Used when traffic_routing_type = CANARY."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.canary_size_percent >= 1 && var.canary_size_percent <= 50 && floor(var.canary_size_percent) == var.canary_size_percent
+    error_message = "canary_size_percent must be a whole number from 1 to 50."
+  }
+}
+
+variable "linear_step_percent" {
+  description = "Percentage of the new fleet's capacity turned on per step (CAPACITY_PERCENT). SageMaker allows 10-50%. Used when traffic_routing_type = LINEAR."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.linear_step_percent >= 10 && var.linear_step_percent <= 50 && floor(var.linear_step_percent) == var.linear_step_percent
+    error_message = "linear_step_percent must be a whole number from 10 to 50."
+  }
+}
+
+variable "traffic_shift_wait_interval" {
+  description = "Baking period in seconds after each traffic shift step (the canary step, or each linear step) while the rollback alarms watch the new fleet (0-3600). Keep it longer than the alarms need to fire: 2 one-minute periods plus CloudWatch delay."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.traffic_shift_wait_interval >= 0 && var.traffic_shift_wait_interval <= 3600
+    error_message = "traffic_shift_wait_interval must be between 0 and 3600 seconds."
+  }
+}
+
+variable "termination_wait_seconds" {
+  description = "Seconds to wait after the new fleet takes all traffic before the old fleet is terminated (0-3600). The rollback alarms keep watching during this final baking period."
+  type        = number
+  default     = 120
+
+  validation {
+    condition     = var.termination_wait_seconds >= 0 && var.termination_wait_seconds <= 3600
+    error_message = "termination_wait_seconds must be between 0 and 3600 seconds."
+  }
+}
+
+variable "deployment_max_timeout" {
+  description = "Maximum deployment time in seconds (600-28800). Must exceed the total of the traffic shift waits and termination_wait_seconds."
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.deployment_max_timeout >= 600 && var.deployment_max_timeout <= 28800
+    error_message = "deployment_max_timeout must be between 600 and 28800 seconds."
+  }
+}
